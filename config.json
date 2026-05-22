@@ -2,17 +2,17 @@
   "_comment": "Strategy parameters. Edit and commit to change daily alert behavior.",
   "buySMA": 200,
   "sellSMA": 200,
-  "buyBuffer": 0,
+  "buyBuffer": 3,
   "sellBuffer": 0,
   "rule1": {
     "_comment": "Trailing-drawdown stop. enabled: turn on/off. dropPct: drawdown %. dropWindow: lookback days.",
-    "enabled": false,
+    "enabled": true,
     "dropPct": 8,
     "dropWindow": 22
   },
   "rule2": {
     "_comment": "Vol-spike exit. volDirSMA: 0=off (pure threshold) or 15/20/25/50 for direction confirm.",
-    "enabled": false,
+    "enabled": true,
     "volPct": 30,
     "volWindow": 10,
     "volDirSMA": 0
