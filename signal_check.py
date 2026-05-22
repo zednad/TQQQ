@@ -151,6 +151,14 @@ def simulate(qqq: pd.Series, cfg: dict) -> dict:
                 "sma_says_in": sma_target == 1,
             }
 
+    if not diag_today:
+        raise RuntimeError(
+            f"No diagnostic snapshot for the last day "
+            f"({qqq.index[-1].strftime('%Y-%m-%d')}); "
+            f"SMA(s) undefined — check the QQQ TSV has at least "
+            f"max(buySMA, sellSMA) days of history."
+        )
+
     pos_today     = "TQQQ" if positions[-1] == 1 else "CASH"
     pos_yesterday = "TQQQ" if positions[-2] == 1 else "CASH"
 
@@ -197,10 +205,10 @@ def build_message(result: dict, cfg: dict, changed: bool) -> str:
             if d["vol_on"] and d["vol_tripped"]:
                 reasons.append(f"vol spike ({d['vol_ann'] * 100:.1f}% &gt; {d['vol_pct'] * 100:.0f}%)")
             lines.append(f"Trigger: {', '.join(reasons) or 'unknown'}")
-            lines.append(f"<b>Action: sell all TQQQ at today's close</b>")
+            lines.append(f"<b>Action: sell all TQQQ at next open</b>")
         else:
             lines.append(f"Trigger: all filters cleared, QQQ &gt; {ref_sma_w}D-SMA buy line")
-            lines.append(f"<b>Action: buy TQQQ at today's close</b>")
+            lines.append(f"<b>Action: buy TQQQ at next open</b>")
         lines.append("")
     else:
         if pos == "TQQQ":
@@ -259,6 +267,24 @@ def send_telegram(text: str) -> None:
         r.raise_for_status()
 
 
+# ---------- State persistence ----------
+
+def load_previous_state(state_path: Path, expected_as_of: str) -> str | None:
+    """Return the position the prior run recorded for `expected_as_of`, if any."""
+    if not state_path.exists():
+        return None
+    try:
+        state = json.loads(state_path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+    if state.get("as_of") != expected_as_of:
+        return None
+    pos = state.get("position")
+    if pos not in ("TQQQ", "CASH"):
+        return None
+    return pos
+
+
 # ---------- Main ----------
 
 def main() -> int:
@@ -272,7 +298,27 @@ def main() -> int:
 
     result = simulate(qqq, cfg)
     pos_today = result["position_today"]
-    pos_yesterday = result["position_yesterday"]
+    sim_yesterday = result["position_yesterday"]
+
+    # auto_adjust=True can retroactively shift historical prices on each
+    # dividend, nudging the 200-SMA and flipping a borderline yesterday in
+    # the re-simulation -> phantom SIGNAL CHANGE alerts. Prefer the prior
+    # run's recorded position when its data date matches.
+    yesterday_as_of = qqq.index[-2].strftime("%Y-%m-%d")
+    stored_yesterday = load_previous_state(STATE_PATH, yesterday_as_of)
+    if stored_yesterday is None:
+        pos_yesterday = sim_yesterday
+    else:
+        pos_yesterday = stored_yesterday
+        if stored_yesterday != sim_yesterday:
+            print(
+                f"Note: simulated yesterday is {sim_yesterday} but stored "
+                f"state for {yesterday_as_of} recorded {stored_yesterday}; "
+                f"trusting stored.",
+                file=sys.stderr,
+            )
+
+    result["position_yesterday"] = pos_yesterday
     changed = (pos_today != pos_yesterday)
 
     print(f"As of {result['diag']['date'].date()}: {pos_today} (yesterday: {pos_yesterday}; changed: {changed})")
