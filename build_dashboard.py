@@ -439,6 +439,21 @@ HTML_TEMPLATE = r"""<!doctype html>
           <span class="chip" data-window="20">20D</span>
         </div>
       </div>
+      <div class="ctrl">
+        <label class="lbl">
+          <span>Direction confirm
+            <span class="info-dot" title="Only trip the vol filter when QQQ is ALSO below this short SMA. Filters out melt-up false-positives (high vol with rising price). Off = pure threshold (Rule 2 trips on any high-vol day regardless of direction).">i</span>
+          </span>
+          <span class="val num" id="volDirLabel"></span>
+        </label>
+        <div class="chips" data-target="volDir">
+          <span class="chip" data-vol-dir="0">Off</span>
+          <span class="chip" data-vol-dir="15">15D</span>
+          <span class="chip" data-vol-dir="20">20D</span>
+          <span class="chip" data-vol-dir="25">25D</span>
+          <span class="chip" data-vol-dir="50">50D</span>
+        </div>
+      </div>
     </div>
 
     <!-- View -->
@@ -537,7 +552,8 @@ for (let i = 1; i < N; i++) logRet[i] = Math.log(qqq[i] / qqq[i-1]);
 const SQRT_252 = Math.sqrt(252);
 
 // Pre-compute SMAs of QQQ for each supported window (today-inclusive rolling mean).
-const SMA_WINDOWS = [100, 150, 200, 250];
+// Short windows (15/20/25/50) are used by Rule 2's direction-confirmation filter.
+const SMA_WINDOWS = [15, 20, 25, 50, 100, 150, 200, 250];
 const smas = {}; // smas[w] -> Float64Array(N)
 for (const w of SMA_WINDOWS) {
   const arr = new Float64Array(N);
@@ -588,9 +604,11 @@ const minStartQ = Math.max(0, quarters.findIndex((_, qi) => quarterStartIdx[qi] 
 function simulate(startIdx, endIdx, initialCash, monthlyContrib,
                   buyBuffer, sellBuffer, buySMAWin, sellSMAWin,
                   dropEnabled, dropPct, dropWindow,
-                  volEnabled, volPct, volWindow) {
+                  volEnabled, volPct, volWindow, volDirSMAWin) {
   const buySmaArr  = smas[buySMAWin];
   const sellSmaArr = smas[sellSMAWin];
+  // Direction-confirmation SMA for Rule 2 (null when off / unused).
+  const volDirSmaArr = (volDirSMAWin && smas[volDirSMAWin]) ? smas[volDirSMAWin] : null;
   const len = endIdx - startIdx + 1;
   const stratVal = new Float64Array(len);
   const tqqqBH = new Float64Array(len);
@@ -682,7 +700,17 @@ function simulate(startIdx, endIdx, initialCash, monthlyContrib,
         for (let j = from; j <= i; j++) { const d = logRet[j] - mean; sse += d * d; }
         const sigDaily = Math.sqrt(sse / (count - 1));
         curVolAnn = sigDaily * SQRT_252;
-        if (volEnabled && curVolAnn > volPct) volTripped = true;
+        if (volEnabled && curVolAnn > volPct) {
+          if (volDirSmaArr === null) {
+            // No direction check — pure threshold.
+            volTripped = true;
+          } else {
+            // Direction-confirmed: only trip when QQQ is below the short SMA too.
+            const dirSma = volDirSmaArr[i];
+            if (!isNaN(dirSma) && qqq[i] < dirSma) volTripped = true;
+            // else: vol is high but price is at/above the short SMA → likely melt-up; don't trip.
+          }
+        }
       }
     }
     volSeries[k] = curVolAnn;
@@ -845,7 +873,8 @@ let state = {
   // Rule 1: trailing-drawdown stop
   dropEnabled: false, dropPct: 8, dropWindow: 22,
   // Rule 2: vol-spike exit
-  volEnabled: false, volPct: 30, volWindow: 10,
+  // volDirSMA: 0 = pure threshold (no direction check); 15/20/25/50 = require qqq < that SMA to trip.
+  volEnabled: false, volPct: 30, volWindow: 10, volDirSMA: 0,
 };
 $("initInput").value = state.initial;
 $("contribInput").value = state.contrib;
@@ -906,6 +935,9 @@ for (const chip of document.querySelectorAll('.chips[data-target="vol"] .chip'))
 for (const chip of document.querySelectorAll('.chips[data-target="volWin"] .chip')) {
   chip.addEventListener("click", () => volWindowSlider.noUiSlider.set(+chip.dataset.window));
 }
+for (const chip of document.querySelectorAll('.chips[data-target="volDir"] .chip')) {
+  chip.addEventListener("click", () => { state.volDirSMA = +chip.dataset.volDir; update(); });
+}
 function updateChips() {
   for (const chip of document.querySelectorAll('.chips[data-target="buy"] .chip')) {
     chip.classList.toggle("active", Math.abs(+chip.dataset.buffer - state.buyBuffer) < 1e-6);
@@ -930,6 +962,9 @@ function updateChips() {
   }
   for (const chip of document.querySelectorAll('.chips[data-target="volWin"] .chip')) {
     chip.classList.toggle("active", +chip.dataset.window === state.volWindow);
+  }
+  for (const chip of document.querySelectorAll('.chips[data-target="volDir"] .chip')) {
+    chip.classList.toggle("active", +chip.dataset.volDir === state.volDirSMA);
   }
 }
 
@@ -983,6 +1018,7 @@ function update() {
   $("dropEnabledLabel").textContent = state.dropEnabled ? "On" : "Off";
   $("volPctLabel").textContent = `${state.volPct}%`;
   $("volWindowLabel").textContent = `${state.volWindow}-day`;
+  $("volDirLabel").textContent    = state.volDirSMA === 0 ? "Off" : `${state.volDirSMA}-day`;
   $("volEnabledLabel").textContent = state.volEnabled ? "On" : "Off";
   // Sync the checkbox visual state to state (covers initial render).
   $("dropEnabled").checked = state.dropEnabled;
@@ -1001,7 +1037,7 @@ function update() {
   const sim = simulate(startIdx, endIdx, state.initial, state.contrib,
                        buyFrac, sellFrac, state.buySMA, state.sellSMA,
                        state.dropEnabled, dropFrac, state.dropWindow,
-                       state.volEnabled,  volFrac,  state.volWindow);
+                       state.volEnabled,  volFrac,  state.volWindow, state.volDirSMA);
   const sliceDates = dates.slice(startIdx, endIdx + 1);
   const len = sim.len;
 
@@ -1028,7 +1064,10 @@ function update() {
                             `buy <b>${state.buySMA}D</b> · sell <b>${state.sellSMA}D</b>`;
   const ruleParts = [];
   if (state.dropEnabled) ruleParts.push(`stop <b>−${state.dropPct.toFixed(1)}% / ${state.dropWindow}D</b>`);
-  if (state.volEnabled)  ruleParts.push(`vol <b>&gt;${state.volPct}% / ${state.volWindow}D</b>`);
+  if (state.volEnabled) {
+    const dirTag = state.volDirSMA === 0 ? "" : ` &amp; &lt;${state.volDirSMA}D-SMA`;
+    ruleParts.push(`vol <b>&gt;${state.volPct}% / ${state.volWindow}D${dirTag}</b>`);
+  }
   const ruleTag = ruleParts.length ? ` · ${ruleParts.join(" · ")}` : "";
   $("portfolioHint").innerHTML =
     `<b>${sim.trades}</b> trades · <b>${inMktPct.toFixed(0)}%</b> in market · ${smaTag} · buffers <b>+${state.buyBuffer.toFixed(2)}%</b> / <b>−${state.sellBuffer.toFixed(2)}%</b>${ruleTag}`;
@@ -1170,6 +1209,16 @@ function update() {
       hovertemplate: "%{x|%Y-%m-%d}<br>Stop level: <b>%{y:$,.2f}</b><extra></extra>",
     });
   }
+  // Rule 2 direction-confirm SMA — only when both Rule 2 and direction-confirm are on.
+  if (state.volEnabled && state.volDirSMA !== 0 && smas[state.volDirSMA]) {
+    const volDirSlice = Array.from(smas[state.volDirSMA].slice(startIdx, endIdx + 1));
+    sigTraces.push({
+      x: sliceDates, y: volDirSlice,
+      name: `Vol-dir ${state.volDirSMA}D SMA`,
+      line: { color: "#fb923c", width: 1.0, dash: "dot" }, opacity: 0.7,
+      hovertemplate: "%{x|%Y-%m-%d}<br>" + state.volDirSMA + "D SMA: <b>%{y:$,.2f}</b><extra></extra>",
+    });
+  }
 
   const hintParts = ["red shading = out of market"];
   hintParts.push(`buy: ${state.buySMA}D` + (buyFrac > 0  ? ` +${state.buyBuffer.toFixed(2)}%`  : ""));
@@ -1222,8 +1271,12 @@ function update() {
     }
   }
   const volHintParts = [`${state.volWindow}-day annualized`];
-  if (state.volEnabled) volHintParts.push(`threshold <b>${state.volPct}%</b> (red)`);
-  else                  volHintParts.push("rule off");
+  if (state.volEnabled) {
+    volHintParts.push(`threshold <b>${state.volPct}%</b> (red)`);
+    if (state.volDirSMA !== 0) volHintParts.push(`dir-confirm: QQQ &lt; <b>${state.volDirSMA}D-SMA</b>`);
+  } else {
+    volHintParts.push("rule off");
+  }
   $("volHint").innerHTML = volHintParts.join(" · ");
 
   Plotly.react("volChart", volTraces, {
