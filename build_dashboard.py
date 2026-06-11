@@ -23,8 +23,11 @@ Strategy (daily, signal evaluated at today's close):
         no direction confirmation, so upward melt-up vol can also trigger.
   * On the first simulated day, the bare SMA test (qqq > sma) — combined with
     the stop check if enabled — sets the initial position.
-  * Monthly contribution on the first trading day of each month lands as
-    cash and is then placed by the same signal-driven rebalance.
+  * Monthly contribution lands as cash and is then placed by the same
+    signal-driven rebalance. A frequency slider splits it across the month:
+    1x deposits everything on the first trading day; 2x deposits half on the
+    first trading day and half on the trading day closest to the 15th
+    (weekends/holidays roll to the nearest session).
 
 All computation runs in the browser so sliders are interactive.
 """
@@ -281,6 +284,19 @@ HTML_TEMPLATE = r"""<!doctype html>
         <div id="contribSlider"></div>
         <div class="row"><span class="prefix">$</span><input type="number" id="contribInput" min="0" step="50" /></div>
       </div>
+      <div class="ctrl">
+        <label class="lbl">
+          <span>Deposits per month
+            <span class="info-dot" title="How the monthly contribution is spread across the month. 1× = all of it on the first trading day. 2× = half on the first trading day, half on the trading day closest to the 15th (rolls to the nearest session over weekends/holidays).">i</span>
+          </span>
+          <span class="val num" id="contribFreqLabel"></span>
+        </label>
+        <div id="contribFreqSlider"></div>
+        <div class="chips" data-target="contribFreq">
+          <span class="chip" data-freq="1">1× · 1st</span>
+          <span class="chip" data-freq="2">2× · 1st &amp; 15th</span>
+        </div>
+      </div>
     </div>
 
     <!-- Strategy -->
@@ -477,7 +493,7 @@ HTML_TEMPLATE = r"""<!doctype html>
         <div class="k">Total invested</div><div class="v" id="sInvested">—</div>
         <div class="k">Initial</div><div class="v" id="sInit">—</div>
         <div class="k">Contributions</div><div class="v" id="sContrib">—</div>
-        <div class="k">Months</div><div class="v" id="sMonths">—</div>
+        <div class="k">Deposits</div><div class="v" id="sMonths">—</div>
         <div class="k">Strategy trades</div><div class="v" id="sTrades">—</div>
         <div class="k">Time in market</div><div class="v" id="sInMkt">—</div>
         <div class="k">Stop exits</div><div class="v" id="sStopExits">—</div>
@@ -572,6 +588,24 @@ const firstOfMonth = new Uint8Array(N);
 firstOfMonth[0] = 1;
 for (let i = 1; i < N; i++) firstOfMonth[i] = dates[i].slice(0, 7) !== dates[i-1].slice(0, 7) ? 1 : 0;
 
+// Mid-month deposit day: the trading day closest to the 15th of each month
+// (a weekend/holiday 15th rolls to the nearest session, earlier on ties).
+const midOfMonth = new Uint8Array(N);
+{
+  let mStart = 0;
+  for (let i = 1; i <= N; i++) {
+    if (i === N || firstOfMonth[i]) {
+      let best = mStart, bestDist = Infinity;
+      for (let j = mStart; j < i; j++) {
+        const dist = Math.abs(+dates[j].slice(8, 10) - 15);
+        if (dist < bestDist) { bestDist = dist; best = j; }
+      }
+      midOfMonth[best] = 1;
+      mStart = i;
+    }
+  }
+}
+
 // Quarter index.
 function dateToQuarter(d) {
   const y = +d.slice(0, 4), m = +d.slice(5, 7);
@@ -601,7 +635,7 @@ const minStartQ = Math.max(0, quarters.findIndex((_, qi) => quarterStartIdx[qi] 
 // Trailing stop: stop_tripped when qqq[i] <= peak_N * (1 - dropPct),
 //   where peak_N = max(qqq[i-N+1 .. i]) (today-inclusive rolling high).
 // SMA undefined (early warmup) -> forced cash.
-function simulate(startIdx, endIdx, initialCash, monthlyContrib,
+function simulate(startIdx, endIdx, initialCash, monthlyContrib, contribTimes,
                   buyBuffer, sellBuffer, buySMAWin, sellSMAWin,
                   dropEnabled, dropPct, dropWindow,
                   volEnabled, volPct, volWindow, volDirSMAWin) {
@@ -644,21 +678,25 @@ function simulate(startIdx, endIdx, initialCash, monthlyContrib,
   let volHoldDays = 0;     // days where vol kept us out (would have been in by SMA alone)
 
   for (let i = startIdx, k = 0; i <= endIdx; i++, k++) {
-    // 1. Monthly contribution lands as cash (skip startIdx — counted as initial deposit).
-    if (firstOfMonth[i] && i !== startIdx && monthlyContrib > 0) {
-      cash += monthlyContrib;
-      tShares += monthlyContrib / tqqq[i];
-      qShares += monthlyContrib / qqq[i];
-      sShares += monthlyContrib / spy[i];
+    // 1. Contribution lands as cash (skip startIdx — counted as initial deposit).
+    //    1x/month: full amount on the first trading day.
+    //    2x/month: half on the first trading day, half on the day nearest the 15th.
+    const depositDay = firstOfMonth[i] || (contribTimes === 2 && midOfMonth[i]);
+    if (depositDay && i !== startIdx && monthlyContrib > 0) {
+      const amt = monthlyContrib / contribTimes;
+      cash += amt;
+      tShares += amt / tqqq[i];
+      qShares += amt / qqq[i];
+      sShares += amt / spy[i];
       cfIdx.push(i - startIdx);
-      cfAmt.push(monthlyContrib);
-      // Dip-Buy strategy: monthly contribution only deploys if QQQ < 200-SMA.
+      cfAmt.push(amt);
+      // Dip-Buy strategy: contribution only deploys if QQQ < 200-SMA.
       // Otherwise skipped — money is NOT held as cash, just forfeited.
       const s200 = sma200[i];
       if (!isNaN(s200) && qqq[i] < s200) {
-        dipShares += monthlyContrib / tqqq[i];
+        dipShares += amt / tqqq[i];
         dipCfIdx.push(i - startIdx);
-        dipCfAmt.push(monthlyContrib);
+        dipCfAmt.push(amt);
       }
     }
 
@@ -836,6 +874,7 @@ const $ = (id) => document.getElementById(id);
 const rangeSlider = $("rangeSlider");
 const initSlider = $("initSlider");
 const contribSlider = $("contribSlider");
+const contribFreqSlider = $("contribFreqSlider");
 const buyBufferSlider = $("buyBufferSlider");
 const sellBufferSlider = $("sellBufferSlider");
 
@@ -850,6 +889,7 @@ noUiSlider.create(rangeSlider, {
 });
 noUiSlider.create(initSlider, { start: [10000], connect: "lower", range: { min: 0, max: 250000 }, step: 500 });
 noUiSlider.create(contribSlider, { start: [500], connect: "lower", range: { min: 0, max: 10000 }, step: 50 });
+noUiSlider.create(contribFreqSlider, { start: [1], connect: "lower", range: { min: 1, max: 2 }, step: 1 });
 noUiSlider.create(buyBufferSlider,  { start: [0], connect: "lower", range: { min: 0, max: 15 }, step: 0.25 });
 noUiSlider.create(sellBufferSlider, { start: [0], connect: "lower", range: { min: 0, max: 15 }, step: 0.25 });
 
@@ -867,7 +907,7 @@ noUiSlider.create(volWindowSlider, { start: [10], connect: "lower", range: { min
 
 let state = {
   startQ: defaultStart, endQ: quarters.length - 1,
-  initial: 10000, contrib: 500,
+  initial: 10000, contrib: 500, contribTimes: 1,
   buyBuffer: 0, sellBuffer: 0,
   buySMA: 200, sellSMA: 200,
   // Rule 1: trailing-drawdown stop
@@ -914,6 +954,10 @@ for (const chip of document.querySelectorAll('.chips[data-target="buy"] .chip'))
 for (const chip of document.querySelectorAll('.chips[data-target="sell"] .chip')) {
   chip.addEventListener("click", () => sellBufferSlider.noUiSlider.set(+chip.dataset.buffer));
 }
+// Deposit-frequency chips
+for (const chip of document.querySelectorAll('.chips[data-target="contribFreq"] .chip')) {
+  chip.addEventListener("click", () => contribFreqSlider.noUiSlider.set(+chip.dataset.freq));
+}
 // SMA selector chips
 for (const chip of document.querySelectorAll('.chips[data-target="buySMA"] .chip')) {
   chip.addEventListener("click", () => { state.buySMA = +chip.dataset.sma; update(); });
@@ -944,6 +988,9 @@ function updateChips() {
   }
   for (const chip of document.querySelectorAll('.chips[data-target="sell"] .chip')) {
     chip.classList.toggle("active", Math.abs(+chip.dataset.buffer - state.sellBuffer) < 1e-6);
+  }
+  for (const chip of document.querySelectorAll('.chips[data-target="contribFreq"] .chip')) {
+    chip.classList.toggle("active", +chip.dataset.freq === state.contribTimes);
   }
   for (const chip of document.querySelectorAll('.chips[data-target="buySMA"] .chip')) {
     chip.classList.toggle("active", +chip.dataset.sma === state.buySMA);
@@ -1009,6 +1056,9 @@ function update() {
   $("rangeLabel").textContent = `${quarters[state.startQ]} → ${quarters[endQ]}`;
   $("initLabel").textContent = fmtMoneyFull(state.initial);
   $("contribLabel").textContent = fmtMoneyFull(state.contrib) + "/mo";
+  $("contribFreqLabel").textContent = state.contribTimes === 1
+    ? "1× — all on the 1st"
+    : `2× — ${fmtMoneyFull(state.contrib / 2)} on 1st & 15th`;
   $("buyBufferLabel").textContent = `+${state.buyBuffer.toFixed(2)}%`;
   $("sellBufferLabel").textContent = `−${state.sellBuffer.toFixed(2)}%`;
   $("buySMALabel").textContent = `${state.buySMA}-day`;
@@ -1034,7 +1084,7 @@ function update() {
   const sellFrac = state.sellBuffer / 100;
   const dropFrac = state.dropPct    / 100;
   const volFrac  = state.volPct     / 100;
-  const sim = simulate(startIdx, endIdx, state.initial, state.contrib,
+  const sim = simulate(startIdx, endIdx, state.initial, state.contrib, state.contribTimes,
                        buyFrac, sellFrac, state.buySMA, state.sellSMA,
                        state.dropEnabled, dropFrac, state.dropWindow,
                        state.volEnabled,  volFrac,  state.volWindow, state.volDirSMA);
@@ -1044,11 +1094,11 @@ function update() {
   // Cash flow + run stats.
   const totalContrib = sim.cfAmt.slice(1).reduce((a,b)=>a+b, 0);
   const totalInvested = state.initial + totalContrib;
-  const months = sim.cfAmt.length - 1;
+  const deposits = sim.cfAmt.length - 1;
   $("sInit").textContent = fmtMoneyFull(state.initial);
   $("sContrib").textContent = fmtMoneyFull(totalContrib);
   $("sInvested").textContent = fmtMoneyFull(totalInvested);
-  $("sMonths").textContent = months.toString();
+  $("sMonths").textContent = deposits.toString();
   $("sTrades").textContent = sim.trades.toString();
   const inMktPct = (sim.daysInMkt / len * 100);
   $("sInMkt").textContent = inMktPct.toFixed(1) + "%";
@@ -1385,6 +1435,10 @@ initSlider.noUiSlider.on("update", (vals) => {
 contribSlider.noUiSlider.on("update", (vals) => {
   state.contrib = Math.round(+vals[0]);
   $("contribInput").value = state.contrib;
+  update();
+});
+contribFreqSlider.noUiSlider.on("update", (vals) => {
+  state.contribTimes = Math.round(+vals[0]);
   update();
 });
 buyBufferSlider.noUiSlider.on("update", (vals) => {
