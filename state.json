@@ -1,6 +1,6 @@
 {
-  "as_of": "2026-07-08",
+  "as_of": "2026-07-09",
   "position": "TQQQ",
-  "previous_position": "CASH",
-  "changed_today": true
+  "previous_position": "TQQQ",
+  "changed_today": false
 }
